@@ -2184,7 +2184,7 @@ fn render_stats_card(
                 data.rank.percentile
             ),
             _ => format!(
-                r#"<text x="-5" y="3" text-anchor="middle" data-testid="level-rank-icon">{}</text>"#,
+                r#"<text x="-5" y="12" text-anchor="middle" data-testid="level-rank-icon">{}</text>"#,
                 escape_html(&data.rank.level)
             ),
         };
