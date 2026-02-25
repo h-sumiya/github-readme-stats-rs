@@ -1951,6 +1951,13 @@ fn log_normal_cdf(x: f64) -> f64 {
     x / (1.0 + x)
 }
 
+fn calculate_circle_progress(value: f64) -> f64 {
+    let radius = 40.0;
+    let circumference = PI * (radius * 2.0);
+    let clamped = value.clamp(0.0, 100.0);
+    ((100.0 - clamped) / 100.0) * circumference
+}
+
 fn render_stats_card(
     data: &StatsCardData,
     params: &HashMap<String, String>,
@@ -2095,7 +2102,14 @@ fn render_stats_card(
         );
     }
 
-    let line_height = parse_i64_param(params, "line_height").unwrap_or(25).max(18) as i32;
+    const CARD_MIN_WIDTH: i32 = 287;
+    const CARD_DEFAULT_WIDTH: i32 = 287;
+    const RANK_CARD_MIN_WIDTH: i32 = 420;
+    const RANK_CARD_DEFAULT_WIDTH: i32 = 450;
+    const RANK_ONLY_CARD_MIN_WIDTH: i32 = 290;
+    const RANK_ONLY_CARD_DEFAULT_WIDTH: i32 = 290;
+
+    let line_height = parse_i64_param(params, "line_height").unwrap_or(25) as i32;
 
     let icon_width = if show_icons && !stat_items.is_empty() {
         17
@@ -2103,22 +2117,28 @@ fn render_stats_card(
         0
     };
 
-    let min_card_width = if hide_rank {
-        (50.0 + measure_text(q(params, "custom_title").unwrap_or("GitHub Stats"), 18.0) * 2.0)
-            .max(287.0) as i32
-            + icon_width
-    } else if stat_items.is_empty() {
-        290 + icon_width
+    let default_title = if stat_items.is_empty() {
+        "GitHub Rank"
     } else {
-        420 + icon_width
+        "GitHub Stats"
+    };
+    let title = q(params, "custom_title").unwrap_or(default_title);
+    let title_width = measure_text(title, 10.0);
+
+    let min_card_width = if hide_rank {
+        ((50.0 + title_width * 2.0).max(CARD_MIN_WIDTH as f64)) as i32 + icon_width
+    } else if stat_items.is_empty() {
+        RANK_ONLY_CARD_MIN_WIDTH + icon_width
+    } else {
+        RANK_CARD_MIN_WIDTH + icon_width
     };
 
     let default_width = if hide_rank {
-        287 + icon_width
+        CARD_DEFAULT_WIDTH + icon_width
     } else if stat_items.is_empty() {
-        290 + icon_width
+        RANK_ONLY_CARD_DEFAULT_WIDTH + icon_width
     } else {
-        450 + icon_width
+        RANK_CARD_DEFAULT_WIDTH + icon_width
     };
 
     let mut width = parse_i64_param(params, "card_width")
@@ -2128,21 +2148,12 @@ fn render_stats_card(
         width = min_card_width;
     }
 
-    let mut height = (45 + (stat_items.len() as i32 + 1) * line_height).max(if hide_rank {
+    let height = (45 + (stat_items.len() as i32 + 1) * line_height).max(if hide_rank {
         0
     } else if stat_items.is_empty() {
         180
     } else {
         150
-    });
-    if height < 80 {
-        height = 80;
-    }
-
-    let title = q(params, "custom_title").unwrap_or(if stat_items.is_empty() {
-        "GitHub Rank"
-    } else {
-        "GitHub Stats"
     });
 
     let rank_icon_type = q(params, "rank_icon").unwrap_or("default");
@@ -2150,13 +2161,19 @@ fn render_stats_card(
     let mut body = String::with_capacity(4096);
 
     if !hide_rank {
-        let rank_x = if stat_items.is_empty() {
-            width as f64 / 2.0
+        let rank_x = if !stat_items.is_empty() {
+            let min_x_translation = RANK_CARD_MIN_WIDTH as f64 + icon_width as f64 - 70.0;
+            if width > RANK_CARD_DEFAULT_WIDTH {
+                let x_max_expansion =
+                    min_x_translation + (RANK_CARD_DEFAULT_WIDTH - min_card_width) as f64 / 2.0;
+                x_max_expansion + (width - RANK_CARD_DEFAULT_WIDTH) as f64
+            } else {
+                min_x_translation + (width - min_card_width) as f64 / 2.0
+            }
         } else {
-            width as f64 - 75.0
+            width as f64 / 2.0 + 10.0
         };
-        let rank_y = height as f64 / 2.0 - 40.0;
-        let progress = (100.0 - data.rank.percentile).clamp(0.0, 100.0);
+        let rank_y = height as f64 / 2.0 - 50.0;
 
         let rank_inner = match rank_icon_type {
             "github" => format!(
@@ -2171,27 +2188,24 @@ fn render_stats_card(
                 escape_html(&data.rank.level)
             ),
         };
-
-        let circumference = PI * 80.0;
-        let dash = ((100.0 - progress) / 100.0) * circumference;
-
         body.push_str(&format!(
             r#"
       <g data-testid="rank-circle" transform="translate({rank_x}, {rank_y})">
         <circle class="rank-circle-rim" cx="-10" cy="8" r="40" />
-        <circle class="rank-circle" cx="-10" cy="8" r="40" style="stroke-dasharray:{circumference};stroke-dashoffset:{dash};" />
+        <circle class="rank-circle" cx="-10" cy="8" r="40" />
         <g class="rank-text">{rank_inner}</g>
       </g>
       "#
         ));
     }
 
+    let shift_value_pos = 79.01;
     let mut y = 0;
     for (idx, item) in stat_items.iter().enumerate() {
         let delay = (idx + 3) * 150;
         let icon_svg = if show_icons {
             format!(
-                r#"<svg data-testid="icon" class="icon" viewBox="0 0 16 16" x="0" y="-12" width="16" height="16">{}</svg>"#,
+                r#"<svg data-testid="icon" class="icon" viewBox="0 0 16 16" version="1.1" width="16" height="16">{}</svg>"#,
                 item.icon
             )
         } else {
@@ -2199,7 +2213,7 @@ fn render_stats_card(
         };
 
         let label_x = if show_icons { 25 } else { 0 };
-        let value_x = if hide_rank { width - 120 } else { width - 230 };
+        let value_x = if show_icons { 140.0 } else { 120.0 } + shift_value_pos;
 
         body.push_str(&format!(
             r#"
@@ -2219,9 +2233,15 @@ fn render_stats_card(
         y += line_height;
     }
 
+    let rank_animation_from = calculate_circle_progress(0.0);
+    let rank_animation_to = calculate_circle_progress(100.0 - data.rank.percentile);
+
     let css = format!(
         r#"
-    .stat {{ font: 600 14px 'Segoe UI', Ubuntu, Sans-Serif; fill: {}; }}
+    .stat {{ font: 600 14px 'Segoe UI', Ubuntu, "Helvetica Neue", Sans-Serif; fill: {}; }}
+    @supports(-moz-appearance: auto) {{
+      .stat {{ font-size:12px; }}
+    }}
     .not_bold {{ font-weight: 400; }}
     .bold {{ font-weight: 700; }}
     .icon {{ fill: {}; display: {}; }}
@@ -2230,8 +2250,8 @@ fn render_stats_card(
     .rank-percentile-header {{ font-size:14px; }}
     .rank-percentile-text {{ font-size:16px; }}
     .rank-circle-rim {{ stroke: {}; fill:none; stroke-width:6; opacity:0.2; }}
-    .rank-circle {{ stroke: {}; fill:none; stroke-width:6; stroke-linecap:round; opacity:0.8; transform-origin:-10px 8px; transform:rotate(-90deg); animation: rankAnimation 1s forwards ease-in-out; }}
-    @keyframes rankAnimation {{ from {{ stroke-dashoffset: 251.327; }} to {{ stroke-dashoffset: 0; }} }}
+    .rank-circle {{ stroke: {}; stroke-dasharray:250; fill:none; stroke-width:6; stroke-linecap:round; opacity:0.8; transform-origin:-10px 8px; transform:rotate(-90deg); animation: rankAnimation 1s forwards ease-in-out; }}
+    @keyframes rankAnimation {{ from {{ stroke-dashoffset: {}; }} to {{ stroke-dashoffset: {}; }} }}
     "#,
         colors.text_color,
         colors.icon_color,
@@ -2239,6 +2259,8 @@ fn render_stats_card(
         colors.text_color,
         colors.ring_color,
         colors.ring_color,
+        rank_animation_from,
+        rank_animation_to,
     );
 
     render_card(CardSpec {
@@ -2289,18 +2311,14 @@ fn render_top_languages_card(
         .map(|v| v.to_ascii_lowercase())
         .collect::<HashSet<_>>();
 
-    let default_count = match layout {
-        "compact" => 6,
-        "donut" => 5,
-        "donut-vertical" => 6,
-        "pie" => 6,
-        _ => {
-            if hide_progress {
-                6
-            } else {
-                5
-            }
-        }
+    let default_count = if layout == "compact" || hide_progress {
+        6
+    } else if layout == "donut" {
+        5
+    } else if layout == "donut-vertical" || layout == "pie" {
+        6
+    } else {
+        5
     };
 
     let langs_count = parse_i64_param(params, "langs_count")
@@ -2324,8 +2342,13 @@ fn render_top_languages_card(
 
     if langs.is_empty() {
         height = 90;
+        let no_data_x = if layout == "pie" || layout == "donut-vertical" {
+            25
+        } else {
+            0
+        };
         body.push_str(&format!(
-            r#"<text x="25" y="11" class="stat bold" fill="{}">No languages data found</text>"#,
+            r#"<text x="{no_data_x}" y="11" class="stat bold" fill="{}">No languages data found</text>"#,
             colors.text_color
         ));
     } else {
@@ -2482,14 +2505,14 @@ fn render_repo_card(
 
     let stats_row = flex_row(
         vec![
-            (language_node, measure_text(&lang_name, 12.0) + 5.0),
+            (language_node, Some(measure_text(&lang_name, 12.0))),
             (
                 stars_node,
-                16.0 + measure_text(&k_formatter(data.star_count as f64, None), 12.0),
+                Some(16.0 + measure_text(&k_formatter(data.star_count as f64, None), 12.0)),
             ),
             (
                 forks_node,
-                16.0 + measure_text(&k_formatter(data.fork_count as f64, None), 12.0),
+                Some(16.0 + measure_text(&k_formatter(data.fork_count as f64, None), 12.0)),
             ),
         ],
         25.0,
@@ -2504,7 +2527,7 @@ fn render_repo_card(
     }
     .map(|label| {
         format!(
-            r#"<g data-testid="badge" class="badge" transform="translate(320,-18)"><rect stroke="{}" stroke-width="1" width="70" height="20" x="-12" y="-14" ry="10" rx="10"></rect><text x="23" y="-5" text-anchor="middle" fill="{}">{}</text></g>"#,
+            r#"<g data-testid="badge" class="badge" transform="translate(320,-18)"><rect stroke="{}" stroke-width="1" width="70" height="20" x="-12" y="-14" ry="10" rx="10"></rect><text x="23" y="-5" alignment-baseline="central" dominant-baseline="central" text-anchor="middle" fill="{}">{}</text></g>"#,
             colors.text_color,
             colors.text_color,
             escape_html(label)
@@ -2601,7 +2624,7 @@ fn render_gist_card(
         vec![
             (
                 create_language_node(&language, &lang_color),
-                measure_text(&language, 12.0) + 5.0,
+                Some(measure_text(&language, 12.0)),
             ),
             (
                 icon_with_label(
@@ -2610,7 +2633,7 @@ fn render_gist_card(
                     "starsCount",
                     16,
                 ),
-                16.0 + measure_text(&k_formatter(data.stars_count as f64, None), 12.0),
+                Some(16.0 + measure_text(&k_formatter(data.stars_count as f64, None), 12.0)),
             ),
             (
                 icon_with_label(
@@ -2619,7 +2642,7 @@ fn render_gist_card(
                     "forksCount",
                     16,
                 ),
-                16.0 + measure_text(&k_formatter(data.forks_count as f64, None), 12.0),
+                Some(16.0 + measure_text(&k_formatter(data.forks_count as f64, None), 12.0)),
             ),
         ],
         25.0,
@@ -2672,7 +2695,7 @@ fn render_wakatime_card(
     let disable_animations = parse_bool_param(params, "disable_animations").unwrap_or(false);
     let layout = q(params, "layout").unwrap_or("normal");
     let display_format = q(params, "display_format").unwrap_or("time");
-    let line_height = parse_i64_param(params, "line_height").unwrap_or(25).max(18) as i32;
+    let line_height = parse_i64_param(params, "line_height").unwrap_or(25) as i32;
 
     let mut width = parse_i64_param(params, "card_width")
         .map(|v| v as i32)
@@ -2702,8 +2725,9 @@ fn render_wakatime_card(
 
     let total_percent = languages.iter().map(|l| l.percent).sum::<f64>();
     if total_percent > 0.0 {
+        let weight = ((100.0 / total_percent) * 100.0).round() / 100.0;
         for lang in &mut languages {
-            lang.percent = (lang.percent * (100.0 / total_percent)).max(0.0);
+            lang.percent = ((lang.percent * weight) * 100.0).round() / 100.0;
         }
     }
 
@@ -2717,18 +2741,18 @@ fn render_wakatime_card(
         height = 90 + ((languages.len() as f64 / 2.0).ceil() as i32) * 25;
 
         if !hide_progress {
-            let bar_width = width - 50;
-            let mut offset = 25.0;
+            let compact_width = width as f64 - 5.0;
+            let mut offset = 0.0;
             body.push_str(&format!(
                 r#"<mask id="rect-mask"><rect x="25" y="0" width="{}" height="8" fill="white" rx="5"/></mask>"#,
-                bar_width - 50
+                compact_width - 50.0
             ));
             for lang in &languages {
                 let color = LANGUAGE_COLORS
                     .get(&lang.name)
                     .cloned()
                     .unwrap_or_else(|| "#858585".to_string());
-                let w = ((bar_width as f64 - 50.0) * lang.percent / 100.0).max(8.0);
+                let w = ((compact_width - 25.0) * lang.percent) / 100.0;
                 body.push_str(&format!(
                     r#"<rect mask="url(#rect-mask)" x="{offset}" y="0" width="{w}" height="8" fill="{color}" data-testid="lang-progress" />"#
                 ));
@@ -2967,6 +2991,11 @@ fn render_card(card: CardSpec) -> String {
         ""
     };
 
+    let rendered_height = if card.hide_title {
+        (card.height - 30).max(1)
+    } else {
+        card.height
+    };
     let main_translate_y = if card.hide_title { 25 } else { 55 };
 
     format!(
@@ -2976,6 +3005,9 @@ fn render_card(card: CardSpec) -> String {
         <desc id="descId">{}</desc>
         <style>
           .header {{ font: 600 18px 'Segoe UI', Ubuntu, Sans-Serif; fill: {}; animation: fadeInAnimation 0.8s ease-in-out forwards; }}
+          @supports(-moz-appearance: auto) {{
+            .header {{ font-size: 15.5px; }}
+          }}
           .icon {{ fill: {}; }}
           {}
           @keyframes scaleInAnimation {{ from {{ transform: translate(-5px,5px) scale(0); }} to {{ transform: translate(-5px,5px) scale(1); }} }}
@@ -2990,9 +3022,9 @@ fn render_card(card: CardSpec) -> String {
       </svg>
     "#,
         card.width,
-        card.height,
+        rendered_height,
         card.width,
-        card.height,
+        rendered_height,
         escape_html(&card.accessibility_title),
         escape_html(&card.accessibility_desc),
         card.colors.title_color,
@@ -3090,15 +3122,18 @@ fn render_compact_lang_layout(
         ));
 
         for lang in langs {
-            let mut section = ((lang.size / total_size) * offset_width as f64).max(2.0);
-            if section < 10.0 {
-                section += 8.0;
-            }
+            let percentage =
+                (((lang.size / total_size) * offset_width as f64) * 100.0).round() / 100.0;
+            let section = if percentage < 10.0 {
+                percentage + 10.0
+            } else {
+                percentage
+            };
             out.push_str(&format!(
                 r#"<rect mask="url(#rect-mask)" data-testid="lang-progress" x="{}" y="0" width="{}" height="8" fill="{}"/>"#,
                 progress_offset, section, lang.color
             ));
-            progress_offset += section;
+            progress_offset += percentage;
         }
     }
 
@@ -3121,31 +3156,23 @@ fn render_compact_lang_layout(
         .collect::<Vec<_>>()
         .join("");
 
+    let max_gap = longest_lang(langs)
+        .map(|lang| {
+            let percent = (lang.size / total_size) * 100.0;
+            20.0 + measure_text(&format!("{} {:.2}%", lang.name, percent), 11.0)
+        })
+        .unwrap_or(150.0);
+    let gap = max_gap.max(150.0);
+
     out.push_str(&format!(
-        r#"<g transform="translate(0,{y_start})"><g transform="translate(0,0)">{left_svg}</g><g transform="translate({},0)">{right_svg}</g></g>"#,
-        (measure_text(
-            &format!(
-                "{} {:.2}%",
-                longest_lang_name(langs),
-                langs
-                    .first()
-                    .map(|l| (l.size / total_size) * 100.0)
-                    .unwrap_or(0.0)
-            ),
-            11.0
-        ) + 20.0)
-        .max(150.0)
+        r#"<g transform="translate(0,{y_start})"><g transform="translate(0,0)">{left_svg}</g><g transform="translate({gap},0)">{right_svg}</g></g>"#
     ));
 
     out
 }
 
-fn longest_lang_name(langs: &[LangData]) -> String {
-    langs
-        .iter()
-        .max_by_key(|l| l.name.len())
-        .map(|l| l.name.clone())
-        .unwrap_or_default()
+fn longest_lang(langs: &[LangData]) -> Option<&LangData> {
+    langs.iter().max_by_key(|l| l.name.len())
 }
 
 fn compact_lang_node(
@@ -3445,26 +3472,48 @@ fn icon_with_label(icon: &str, label: &str, testid: &str, icon_size: i32) -> Str
         escape_html(label)
     );
 
-    flex_row(
-        vec![(icon_svg, 16.0), (text, measure_text(label, 12.0))],
-        20.0,
-    )
+    flex_row(vec![(icon_svg, None), (text, None)], 20.0)
 }
 
-fn flex_row(items: Vec<(String, f64)>, gap: f64) -> String {
+fn flex_row(items: Vec<(String, Option<f64>)>, gap: f64) -> String {
     let mut out = String::new();
     let mut offset = 0.0;
     for (item, size) in items.into_iter().filter(|(s, _)| !s.is_empty()) {
         out.push_str(&format!(
             r#"<g transform="translate({offset},0)">{item}</g>"#
         ));
-        offset += size + gap;
+        offset += size.unwrap_or(0.0) + gap;
     }
     out
 }
 
+const TEXT_WIDTHS: &[f64] = &[
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2796875, 0.2765625,
+    0.3546875, 0.5546875, 0.5546875, 0.8890625, 0.665625, 0.190625, 0.3328125, 0.3328125,
+    0.3890625, 0.5828125, 0.2765625, 0.3328125, 0.2765625, 0.3015625, 0.5546875, 0.5546875,
+    0.5546875, 0.5546875, 0.5546875, 0.5546875, 0.5546875, 0.5546875, 0.5546875, 0.5546875,
+    0.2765625, 0.2765625, 0.584375, 0.5828125, 0.584375, 0.5546875, 1.0140625, 0.665625, 0.665625,
+    0.721875, 0.721875, 0.665625, 0.609375, 0.7765625, 0.721875, 0.2765625, 0.5, 0.665625,
+    0.5546875, 0.8328125, 0.721875, 0.7765625, 0.665625, 0.7765625, 0.721875, 0.665625, 0.609375,
+    0.721875, 0.665625, 0.94375, 0.665625, 0.665625, 0.609375, 0.2765625, 0.3546875, 0.2765625,
+    0.4765625, 0.5546875, 0.3328125, 0.5546875, 0.5546875, 0.5, 0.5546875, 0.5546875, 0.2765625,
+    0.5546875, 0.5546875, 0.221875, 0.240625, 0.5, 0.221875, 0.8328125, 0.5546875, 0.5546875,
+    0.5546875, 0.5546875, 0.3328125, 0.5, 0.2765625, 0.5546875, 0.5, 0.721875, 0.5, 0.5, 0.5,
+    0.3546875, 0.259375, 0.353125, 0.5890625,
+];
+const TEXT_WIDTH_AVG: f64 = 0.5279276315789471;
+
 fn measure_text(text: &str, font_size: f64) -> f64 {
-    text.chars().count() as f64 * font_size * 0.53
+    text.chars()
+        .map(|ch| {
+            TEXT_WIDTHS
+                .get(ch as usize)
+                .copied()
+                .unwrap_or(TEXT_WIDTH_AVG)
+        })
+        .sum::<f64>()
+        * font_size
 }
 
 fn k_formatter(num: f64, precision: Option<usize>) -> String {
