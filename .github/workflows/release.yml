@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build server binary
+        run: cargo build --release --locked
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p dist
+          install -m 755 target/release/github-readme-stats-rs dist/github-readme-stats-rs-linux-x86_64
+          tar -C dist -czf dist/github-readme-stats-rs-linux-x86_64.tar.gz github-readme-stats-rs-linux-x86_64
+          sha256sum dist/github-readme-stats-rs-linux-x86_64 dist/github-readme-stats-rs-linux-x86_64.tar.gz > dist/checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/github-readme-stats-rs-linux-x86_64
+            dist/github-readme-stats-rs-linux-x86_64.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
