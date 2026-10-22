@@ -24,25 +24,7 @@ pub(super) async fn stats_handler(
             return svg_error_payload(svg, &state.config);
         }
 
-        let show = parse_csv_param(&params, "show");
-        let include_merged = show
-            .iter()
-            .any(|x| x == "prs_merged" || x == "prs_merged_percentage");
-        let include_discussions = show.iter().any(|x| x == "discussions_started");
-        let include_discussions_answers = show.iter().any(|x| x == "discussions_answered");
-
-        match fetch_stats(
-            &state,
-            username.unwrap_or_default(),
-            parse_bool_param(&params, "include_all_commits").unwrap_or(false),
-            parse_csv_param(&params, "exclude_repo"),
-            include_merged,
-            include_discussions,
-            include_discussions_answers,
-            parse_i64_param(&params, "commits_year"),
-        )
-        .await
-        {
+        match fetch_stats(&state, username.unwrap_or_default(), &params).await {
             Ok(stats) => {
                 let cache_seconds = resolve_cache_seconds(
                     parse_i64_param(&params, "cache_seconds"),
@@ -123,6 +105,7 @@ pub(super) async fn top_langs_handler(
                 parse_csv_param(&params, "exclude_repo"),
                 parse_f64_param(&params, "size_weight").unwrap_or(1.0),
                 parse_f64_param(&params, "count_weight").unwrap_or(0.0),
+                &params,
             )
             .await
             {
@@ -159,7 +142,8 @@ pub(super) async fn pin_handler(
 ) -> Response<Body> {
     handle_svg_cached(state, "/api/pin", params, |state, params| async move {
         let render_options = render_options_from_query(&params);
-        let username = q(&params, "username");
+        let username = q(&params, "username")
+            .or_else(|| q(&params, "repo").and_then(|v| v.split_once('/').map(|(owner, _)| owner)));
 
         if let Some(svg) = guard_access(
             &state.config,
@@ -170,13 +154,7 @@ pub(super) async fn pin_handler(
             return svg_error_payload(svg, &state.config);
         }
 
-        match fetch_repo(
-            &state,
-            username.unwrap_or_default(),
-            q(&params, "repo").unwrap_or_default(),
-        )
-        .await
-        {
+        match fetch_extended_repo(&state, username.unwrap_or_default(), &params).await {
             Ok(repo) => {
                 let cache_seconds = resolve_cache_seconds(
                     parse_i64_param(&params, "cache_seconds"),

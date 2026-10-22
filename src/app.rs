@@ -18,9 +18,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{error, info};
+use tracing::info;
 
 mod api;
+mod extended;
+use extended::*;
+#[cfg(test)]
+mod tests;
 
 const DAY_SECONDS: u64 = 24 * 60 * 60;
 const ERROR_CACHE_SECONDS: u64 = 10 * 60;
@@ -47,7 +51,7 @@ const ICON_PRS_MERGED: &str = r#"<path fill-rule="evenodd" d="M5.45 5.154A4.25 4
 const ICON_PRS_MERGED_PERCENT: &str = r#"<path fill-rule="evenodd" d="M13.442 2.558a.625.625 0 0 1 0 .884l-10 10a.625.625 0 1 1-.884-.884l10-10a.625.625 0 0 1 .884 0zM4.5 6a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm0 1a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zm7 6a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm0 1a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z" />"#;
 
 const STATS_QUERY: &str = r#"
-query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null) {
+query userInfo($login: String!, $after: String, $includeMergedPullRequests: Boolean!, $includeDiscussions: Boolean!, $includeDiscussionsAnswers: Boolean!, $startTime: DateTime = null, $ownerAffiliations: [RepositoryAffiliation], $includeUserRepositories: Boolean!, $includeYears: Boolean!) {
   user(login: $login) {
     name
     login
@@ -57,7 +61,7 @@ query userInfo($login: String!, $after: String, $includeMergedPullRequests: Bool
     reviews: contributionsCollection {
       totalPullRequestReviewContributions
     }
-    repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY]) {
+    repositoriesContributedTo(first: 1, contributionTypes: [COMMIT, ISSUE, PULL_REQUEST, REPOSITORY], includeUserRepositories: $includeUserRepositories) {
       totalCount
     }
     pullRequests(first: 1) {
@@ -81,13 +85,12 @@ query userInfo($login: String!, $after: String, $includeMergedPullRequests: Bool
     repositoryDiscussionComments(onlyAnswers: true) @include(if: $includeDiscussionsAnswers) {
       totalCount
     }
-    repositories(first: 100, ownerAffiliations: OWNER, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
+    contributionsCollection @include(if: $includeYears) { contributionYears }
+    repositories(first: 100, ownerAffiliations: $ownerAffiliations, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
       totalCount
       nodes {
         name
-        stargazers {
-          totalCount
-        }
+        stargazerCount
       }
       pageInfo {
         hasNextPage
@@ -99,15 +102,13 @@ query userInfo($login: String!, $after: String, $includeMergedPullRequests: Bool
 "#;
 
 const STATS_REPOS_QUERY: &str = r#"
-query userInfo($login: String!, $after: String) {
+query userInfo($login: String!, $after: String, $ownerAffiliations: [RepositoryAffiliation]) {
   user(login: $login) {
-    repositories(first: 100, ownerAffiliations: OWNER, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
+    repositories(first: 100, ownerAffiliations: $ownerAffiliations, orderBy: {direction: DESC, field: STARGAZERS}, after: $after) {
       totalCount
       nodes {
         name
-        stargazers {
-          totalCount
-        }
+        stargazerCount
       }
       pageInfo {
         hasNextPage
@@ -119,9 +120,9 @@ query userInfo($login: String!, $after: String) {
 "#;
 
 const TOP_LANGS_QUERY: &str = r#"
-query userInfo($login: String!) {
+query userInfo($login: String!, $ownerAffiliations: [RepositoryAffiliation]) {
   user(login: $login) {
-    repositories(ownerAffiliations: OWNER, isFork: false, first: 100) {
+    repositories(ownerAffiliations: $ownerAffiliations, isFork: false, first: 100) {
       nodes {
         name
         languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
@@ -146,9 +147,7 @@ fragment RepoInfo on Repository {
   isPrivate
   isArchived
   isTemplate
-  stargazers {
-    totalCount
-  }
+  stargazerCount
   description
   primaryLanguage {
     color
@@ -158,15 +157,8 @@ fragment RepoInfo on Repository {
   forkCount
 }
 query getRepo($login: String!, $repo: String!) {
-  user(login: $login) {
-    repository(name: $repo) {
-      ...RepoInfo
-    }
-  }
-  organization(login: $login) {
-    repository(name: $repo) {
-      ...RepoInfo
-    }
+  repository(owner: $login, name: $repo) {
+    ...RepoInfo
   }
 }
 "#;
@@ -239,7 +231,8 @@ struct AppConfig {
     port: u16,
     node_env: String,
     cache_seconds_override: Option<u64>,
-    fetch_multi_page_stars: bool,
+    fetch_multi_page_stars: usize,
+    api_base_url: String,
     tokens: Vec<TokenEntry>,
     exclude_repos: HashSet<String>,
     whitelist: Option<HashSet<String>>,
@@ -257,10 +250,8 @@ impl AppConfig {
         let cache_seconds_override = env::var("CACHE_SECONDS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
-        let fetch_multi_page_stars = env::var("FETCH_MULTI_PAGE_STARS")
-            .ok()
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let fetch_multi_page_stars =
+            parse_star_page_limit(env::var("FETCH_MULTI_PAGE_STARS").ok().as_deref());
 
         let mut pat_vars: Vec<(usize, TokenEntry)> = env::vars()
             .filter_map(|(k, v)| {
@@ -273,13 +264,13 @@ impl AppConfig {
 
         let mut tokens: Vec<TokenEntry> = pat_vars.into_iter().map(|(_, t)| t).collect();
 
-        if tokens.is_empty() {
-            if let Ok(token) = env::var("GITHUB_TOKEN") {
-                tokens.push(TokenEntry {
-                    name: "GITHUB_TOKEN".to_string(),
-                    token,
-                });
-            }
+        if tokens.is_empty()
+            && let Ok(token) = env::var("GITHUB_TOKEN")
+        {
+            tokens.push(TokenEntry {
+                name: "GITHUB_TOKEN".to_string(),
+                token,
+            });
         }
 
         let exclude_repos = split_csv(&env::var("EXCLUDE_REPO").unwrap_or_default())
@@ -307,6 +298,7 @@ impl AppConfig {
             node_env,
             cache_seconds_override,
             fetch_multi_page_stars,
+            api_base_url: "https://api.github.com".to_string(),
             tokens,
             exclude_repos,
             whitelist,
@@ -391,6 +383,9 @@ struct RenderOptions {
     bg_color: Option<String>,
     border_color: Option<String>,
     theme: Option<String>,
+    prog_bar_bg_color: Option<String>,
+    light: Option<Box<RenderOptions>>,
+    dark: Option<Box<RenderOptions>>,
 }
 
 #[derive(Clone)]
@@ -401,6 +396,9 @@ struct CardColors {
     ring_color: String,
     border_color: String,
     bg_color: BackgroundFill,
+    prog_bar_bg_color: String,
+    theme_css: String,
+    theme_defs: String,
 }
 
 #[derive(Clone)]
@@ -412,15 +410,6 @@ enum BackgroundFill {
 #[derive(Deserialize)]
 struct GraphQlEnvelope<T> {
     data: Option<T>,
-    errors: Option<Vec<GraphQlError>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GraphQlError {
-    #[serde(default)]
-    message: String,
-    #[serde(default, rename = "type")]
-    kind: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -440,7 +429,8 @@ struct PageInfo {
 #[derive(Debug, Clone, Deserialize)]
 struct StarNode {
     name: String,
-    stargazers: CountNode,
+    #[serde(rename = "stargazerCount")]
+    stargazer_count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -467,6 +457,8 @@ struct StatsUser {
     name: Option<String>,
     #[serde(default)]
     login: String,
+    #[serde(default, rename = "contributionsCollection")]
+    contribution_years: Option<ContributionYears>,
     commits: StatsContributions,
     reviews: StatsContributions,
     #[serde(rename = "repositoriesContributedTo")]
@@ -564,7 +556,8 @@ struct RepoCardRepo {
     is_archived: bool,
     #[serde(rename = "isTemplate")]
     is_template: bool,
-    stargazers: CountNode,
+    #[serde(rename = "stargazerCount")]
+    stargazer_count: i64,
     #[serde(default)]
     description: Option<String>,
     #[serde(default, rename = "primaryLanguage")]
@@ -574,17 +567,8 @@ struct RepoCardRepo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct RepoUserOrOrg {
-    #[serde(default)]
-    repository: Option<RepoCardRepo>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct RepoData {
-    #[serde(default)]
-    user: Option<RepoUserOrOrg>,
-    #[serde(default)]
-    organization: Option<RepoUserOrOrg>,
+    repository: Option<RepoCardRepo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -651,6 +635,7 @@ struct StatsCardData {
     total_discussions_answered: i64,
     contributed_to: i64,
     rank: Rank,
+    extended_stats: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -670,6 +655,7 @@ struct RepoCardData {
     is_template: bool,
     star_count: i64,
     fork_count: i64,
+    extended_stats: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +716,7 @@ pub async fn run() {
 
     let github_client = Client::builder()
         .user_agent("github-readme-stats-rs/0.1.0")
+        .timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(32)
         .brotli(true)
@@ -739,6 +726,7 @@ pub async fn run() {
 
     let http_client = Client::builder()
         .user_agent("github-readme-stats-rs/0.1.0")
+        .timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(16)
         .brotli(true)
@@ -989,18 +977,26 @@ fn guard_access(
     if id.is_empty() {
         return None;
     }
+    if !safe_identifier(id) {
+        return Some(render_error_card(
+            "Invalid identifier",
+            None,
+            options,
+            false,
+        ));
+    }
 
     match access_type {
         AccessType::Gist => {
-            if let Some(wl) = &config.gist_whitelist {
-                if !wl.contains(id) {
-                    return Some(render_error_card(
-                        "This gist ID is not whitelisted",
-                        Some("Please deploy your own instance"),
-                        options,
-                        false,
-                    ));
-                }
+            if let Some(wl) = &config.gist_whitelist
+                && !wl.contains(id)
+            {
+                return Some(render_error_card(
+                    "This gist ID is not whitelisted",
+                    Some("Please deploy your own instance"),
+                    options,
+                    false,
+                ));
             }
         }
         AccessType::Username | AccessType::Wakatime => {
@@ -1073,18 +1069,15 @@ fn parse_bool(input: &str) -> Option<bool> {
 }
 
 fn render_options_from_query(params: &HashMap<String, String>) -> RenderOptions {
-    RenderOptions {
-        title_color: q(params, "title_color").map(str::to_string),
-        icon_color: q(params, "icon_color").map(str::to_string),
-        text_color: q(params, "text_color").map(str::to_string),
-        ring_color: q(params, "ring_color").map(str::to_string),
-        bg_color: q(params, "bg_color").map(str::to_string),
-        border_color: q(params, "border_color").map(str::to_string),
-        theme: q(params, "theme").map(str::to_string),
-    }
+    let mut base = palette_options(params, "", &RenderOptions::default());
+    base.light =
+        has_palette(params, "_light").then(|| Box::new(palette_options(params, "_light", &base)));
+    base.dark =
+        has_palette(params, "_dark").then(|| Box::new(palette_options(params, "_dark", &base)));
+    base
 }
 
-fn get_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
+fn solid_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
     let default = THEMES.get("default").expect("default theme must exist");
     let selected = options
         .theme
@@ -1103,7 +1096,7 @@ fn get_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
         options
             .title_color
             .as_deref()
-            .or_else(|| Some(selected.title_color.as_str())),
+            .or(Some(selected.title_color.as_str())),
         &format!("#{}", default.title_color),
     );
 
@@ -1111,7 +1104,7 @@ fn get_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
         options
             .icon_color
             .as_deref()
-            .or_else(|| Some(selected.icon_color.as_str())),
+            .or(Some(selected.icon_color.as_str())),
         &format!("#{}", default.icon_color),
     );
 
@@ -1119,7 +1112,7 @@ fn get_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
         options
             .text_color
             .as_deref()
-            .or_else(|| Some(selected.text_color.as_str())),
+            .or(Some(selected.text_color.as_str())),
         &format!("#{}", default.text_color),
     );
 
@@ -1127,7 +1120,7 @@ fn get_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
         options
             .ring_color
             .as_deref()
-            .or_else(|| selected.ring_color.as_deref()),
+            .or(selected.ring_color.as_deref()),
         &title_color,
     );
 
@@ -1135,7 +1128,7 @@ fn get_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
         options
             .bg_color
             .as_deref()
-            .or_else(|| Some(selected.bg_color.as_str())),
+            .or(Some(selected.bg_color.as_str())),
         &format!("#{}", default.bg_color),
     );
 
@@ -1151,6 +1144,9 @@ fn get_card_colors(options: &RenderOptions, default_theme: &str) -> CardColors {
         ring_color,
         border_color,
         bg_color,
+        prog_bar_bg_color: parse_solid_color(options.prog_bar_bg_color.as_deref(), "#ddd"),
+        theme_css: String::new(),
+        theme_defs: String::new(),
     }
 }
 
@@ -1164,7 +1160,11 @@ fn parse_background_color(input: Option<&str>, fallback: &str) -> BackgroundFill
     if let Some(input) = input {
         let parts: Vec<&str> = input.split(',').collect();
         if parts.len() > 2 {
-            let angle = parts[0].trim().to_string();
+            let angle = parts[0]
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite());
             let mut gradient_colors = Vec::new();
             for part in &parts[1..] {
                 if let Some(color) = parse_hex_color(Some(part.trim())) {
@@ -1174,9 +1174,11 @@ fn parse_background_color(input: Option<&str>, fallback: &str) -> BackgroundFill
                     break;
                 }
             }
-            if gradient_colors.len() > 1 {
+            if gradient_colors.len() > 1
+                && let Some(angle) = angle
+            {
                 return BackgroundFill::Gradient {
-                    angle,
+                    angle: angle.to_string(),
                     colors: gradient_colors,
                 };
             }
@@ -1206,167 +1208,40 @@ async fn graphql_request<T: DeserializeOwned>(
     query: &str,
     variables: Value,
 ) -> Result<GraphQlEnvelope<T>, AppError> {
-    if state.config.tokens.is_empty() {
-        return Err(AppError::NoTokens);
-    }
-
-    let total = state.config.tokens.len();
-    let start = state.next_token.fetch_add(1, AtomicOrdering::Relaxed) % total;
-
-    for offset in 0..total {
-        let idx = (start + offset) % total;
-        let token = &state.config.tokens[idx];
-
-        let req = state
-            .github_client
-            .post("https://api.github.com/graphql")
-            .bearer_auth(&token.token)
-            .json(&json!({ "query": query, "variables": variables }));
-
-        let resp = match req.send().await {
-            Ok(resp) => resp,
-            Err(err) => {
-                error!("graphql send failed with {}: {err}", token.name);
-                continue;
-            }
-        };
-
-        let status = resp.status();
-        let text = match resp.text().await {
-            Ok(text) => text,
-            Err(err) => {
-                error!("graphql body read failed with {}: {err}", token.name);
-                continue;
-            }
-        };
-
-        let text_lc = text.to_ascii_lowercase();
-        if status == StatusCode::UNAUTHORIZED
-            || text_lc.contains("bad credentials")
-            || text_lc.contains("account was suspended")
-        {
-            info!("token {} invalid, trying next", token.name);
-            continue;
-        }
-
-        if status == StatusCode::FORBIDDEN && text_lc.contains("rate limit") {
-            info!("token {} rate-limited, trying next", token.name);
-            continue;
-        }
-
-        let raw: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(err) => {
-                return Err(AppError::Message(format!(
-                    "GitHub response parse error: {err}"
-                )));
-            }
-        };
-
-        if let Some(errors) = raw.get("errors").and_then(|v| v.as_array()) {
-            let first_type = errors
-                .first()
-                .and_then(|e| e.get("type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let first_message = errors
-                .first()
-                .and_then(|e| e.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-
-            if first_type == "RATE_LIMITED" || first_message.contains("rate limit") {
-                info!("token {} graphql rate-limited, trying next", token.name);
-                continue;
-            }
-        }
-
-        let envelope = serde_json::from_value::<GraphQlEnvelope<T>>(raw)
-            .map_err(|e| AppError::Message(format!("GraphQL decode error: {e}")))?;
-
-        return Ok(envelope);
-    }
-
-    Err(AppError::MaxRetry)
-}
-
-async fn fetch_total_commits(state: &AppState, username: &str) -> Result<i64, AppError> {
-    if state.config.tokens.is_empty() {
-        return Err(AppError::NoTokens);
-    }
-
-    let total = state.config.tokens.len();
-    let start = state.next_token.fetch_add(1, AtomicOrdering::Relaxed) % total;
-
-    for offset in 0..total {
-        let idx = (start + offset) % total;
-        let token = &state.config.tokens[idx];
-
-        let response = state
-            .github_client
-            .get(format!(
-                "https://api.github.com/search/commits?q=author:{username}"
-            ))
-            .header("Accept", "application/vnd.github.cloak-preview")
-            .header("Authorization", format!("token {}", token.token))
-            .send()
-            .await;
-
-        let response = match response {
-            Ok(r) => r,
-            Err(err) => {
-                error!("commits fetch failed {}: {err}", token.name);
-                continue;
-            }
-        };
-
-        let status = response.status();
-        let value = match response.json::<Value>().await {
-            Ok(v) => v,
-            Err(err) => {
-                error!("commits json decode failed {}: {err}", token.name);
-                continue;
-            }
-        };
-
-        let message = value
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-
-        if status == StatusCode::UNAUTHORIZED || message.contains("bad credentials") {
-            continue;
-        }
-        if message.contains("rate limit") {
-            continue;
-        }
-
-        if let Some(total_count) = value.get("total_count").and_then(|v| v.as_i64()) {
-            return Ok(total_count);
-        }
-    }
-
-    Err(AppError::Message(
-        "Could not fetch total commits.".to_string(),
-    ))
+    let raw = github_json(
+        state,
+        "/graphql",
+        None,
+        Some(json!({"query": query, "variables": variables})),
+    )
+    .await?;
+    serde_json::from_value(raw).map_err(|e| AppError::Message(format!("GraphQL decode error: {e}")))
 }
 
 async fn fetch_stats(
     state: &AppState,
     username: &str,
-    include_all_commits: bool,
-    mut exclude_repo: Vec<String>,
-    include_merged_prs: bool,
-    include_discussions: bool,
-    include_discussions_answers: bool,
-    commits_year: Option<i64>,
+    params: &HashMap<String, String>,
 ) -> Result<StatsCardData, AppError> {
     if username.trim().is_empty() {
         return Err(AppError::MissingParam("\"username\"".to_string()));
     }
 
+    validate_search_params(params)?;
+    let include_all_commits = parse_bool_param(params, "include_all_commits").unwrap_or(false);
+    let commits_year = parse_i64_param(params, "commits_year");
+    let mut exclude_repo = parse_csv_param(params, "exclude_repo");
+    let show = parse_csv_param(params, "show");
+    let include_merged_prs = show
+        .iter()
+        .any(|v| v == "prs_merged" || v == "prs_merged_percentage");
+    let include_discussions = show.iter().any(|v| v == "discussions_started");
+    let include_discussions_answers = show.iter().any(|v| v == "discussions_answered");
+    let include_own = parse_bool_param(params, "contribs_include_own_repos").unwrap_or(false);
+    let include_years = show
+        .iter()
+        .any(|v| v == "contributions" || v == "all_time_contribs");
+    let roles = owner_affiliations(params)?;
     for repo in &state.config.exclude_repos {
         exclude_repo.push(repo.clone());
     }
@@ -1380,20 +1255,21 @@ async fn fetch_stats(
         "includeDiscussions": include_discussions,
         "includeDiscussionsAnswers": include_discussions_answers,
         "startTime": start_time,
+        "ownerAffiliations": roles,
+        "includeUserRepositories": include_own,
+        "includeYears": include_years,
     });
 
     let first = graphql_request::<StatsData>(state, STATS_QUERY, variables).await?;
-
-    if let Some(errors) = &first.errors {
-        return map_graphql_error(errors);
-    }
 
     let mut user = first
         .data
         .and_then(|d| d.user)
         .ok_or_else(|| AppError::Message("Could not fetch user.".to_string()))?;
 
-    if state.config.fetch_multi_page_stars {
+    if state.config.fetch_multi_page_stars > 1 {
+        let mut fetched_pages = 1;
+        let mut seen_cursors = HashSet::new();
         let mut has_next = user
             .repositories
             .page_info
@@ -1406,30 +1282,40 @@ async fn fetch_stats(
             .as_ref()
             .and_then(|p| p.end_cursor.clone());
 
-        while has_next {
+        while has_next && fetched_pages < state.config.fetch_multi_page_stars {
+            if user.repositories.nodes.is_empty() {
+                break;
+            }
+            let Some(cursor) = after.as_ref() else {
+                break;
+            };
+            if !seen_cursors.insert(cursor.clone()) {
+                break;
+            }
             let nodes_with_stars = user
                 .repositories
                 .nodes
                 .iter()
-                .filter(|n| n.stargazers.total_count > 0)
+                .filter(|n| n.stargazer_count > 0)
                 .count();
             if nodes_with_stars != user.repositories.nodes.len() {
                 break;
             }
 
-            let vars = json!({ "login": username, "after": after });
+            let vars = json!({ "login": username, "after": after, "ownerAffiliations": roles });
             let next =
                 graphql_request::<StatsReposOnlyData>(state, STATS_REPOS_QUERY, vars).await?;
-            if let Some(errors) = &next.errors {
-                return map_graphql_error(errors);
-            }
 
             let Some(data) = next.data.and_then(|d| d.user) else {
                 break;
             };
 
             let repo_conn = data.repositories;
+            if repo_conn.nodes.is_empty() {
+                break;
+            }
             user.repositories.nodes.extend(repo_conn.nodes);
+            fetched_pages += 1;
             has_next = repo_conn
                 .page_info
                 .as_ref()
@@ -1440,7 +1326,7 @@ async fn fetch_stats(
     }
 
     let total_commits = if include_all_commits {
-        fetch_total_commits(state, username).await?
+        search_count(state, "commits", &format!("author:{username}"), params).await?
     } else {
         user.commits.total_commit_contributions
     };
@@ -1485,7 +1371,7 @@ async fn fetch_stats(
         .nodes
         .iter()
         .filter(|repo| !hidden.contains(&repo.name))
-        .map(|repo| repo.stargazers.total_count)
+        .map(|repo| repo.stargazer_count)
         .sum::<i64>();
 
     let name = user.name.unwrap_or_else(|| user.login.clone());
@@ -1500,6 +1386,19 @@ async fn fetch_stats(
         user.followers.total_count,
     );
 
+    let mut extended_stats = fetch_search_stats(state, username, params).await?;
+    if include_years {
+        let years = user
+            .contribution_years
+            .as_ref()
+            .map(|v| v.years.as_slice())
+            .ok_or_else(|| {
+                AppError::Message("GitHub did not return contribution years".to_string())
+            })?;
+        extended_stats
+            .extend(fetch_all_time_stats(state, username, years, &show, include_own).await?);
+    }
+
     Ok(StatsCardData {
         name,
         total_prs,
@@ -1513,21 +1412,8 @@ async fn fetch_stats(
         total_discussions_answered,
         contributed_to: user.repositories_contributed_to.total_count,
         rank,
+        extended_stats,
     })
-}
-
-fn map_graphql_error(errors: &[GraphQlError]) -> Result<StatsCardData, AppError> {
-    if let Some(first) = errors.first() {
-        if first.kind == "NOT_FOUND" {
-            return Err(AppError::UserNotFound);
-        }
-        if !first.message.is_empty() {
-            return Err(AppError::Message(wrap_line(&first.message, 90)));
-        }
-    }
-    Err(AppError::Message(
-        "Something went wrong while trying to retrieve the data using the GraphQL API.".to_string(),
-    ))
 }
 
 async fn fetch_top_languages(
@@ -1536,6 +1422,7 @@ async fn fetch_top_languages(
     mut exclude_repo: Vec<String>,
     size_weight: f64,
     count_weight: f64,
+    params: &HashMap<String, String>,
 ) -> Result<Vec<LangData>, AppError> {
     if username.trim().is_empty() {
         return Err(AppError::MissingParam("\"username\"".to_string()));
@@ -1547,22 +1434,12 @@ async fn fetch_top_languages(
 
     let hidden = exclude_repo.into_iter().collect::<HashSet<_>>();
 
-    let response =
-        graphql_request::<TopLangData>(state, TOP_LANGS_QUERY, json!({"login": username})).await?;
-
-    if let Some(errors) = &response.errors {
-        if let Some(first) = errors.first() {
-            if first.kind == "NOT_FOUND" {
-                return Err(AppError::UserNotFound);
-            }
-            if !first.message.is_empty() {
-                return Err(AppError::Message(wrap_line(&first.message, 90)));
-            }
-        }
-        return Err(AppError::Message(
-            "Something went wrong while trying to retrieve the language data using the GraphQL API.".to_string(),
-        ));
-    }
+    let response = graphql_request::<TopLangData>(
+        state,
+        TOP_LANGS_QUERY,
+        json!({"login": username, "ownerAffiliations": owner_affiliations(params)?}),
+    )
+    .await?;
 
     let repos = response
         .data
@@ -1625,27 +1502,13 @@ async fn fetch_repo(
     )
     .await?;
 
-    if let Some(errors) = &response.errors {
-        if let Some(first) = errors.first() {
-            return Err(AppError::Message(first.message.clone()));
-        }
-    }
-
     let data = response
         .data
         .ok_or_else(|| AppError::Message("Not found".to_string()))?;
 
-    let pick = data
-        .user
-        .as_ref()
-        .and_then(|u| u.repository.clone())
-        .or_else(|| {
-            data.organization
-                .as_ref()
-                .and_then(|o| o.repository.clone())
-        });
-
-    let repo = pick.ok_or_else(|| AppError::Message("Repository not found".to_string()))?;
+    let repo = data
+        .repository
+        .ok_or_else(|| AppError::Message("Repository not found".to_string()))?;
 
     if repo.is_private {
         return Err(AppError::Message("Repository not found".to_string()));
@@ -1659,8 +1522,9 @@ async fn fetch_repo(
         primary_language_color: repo.primary_language.as_ref().and_then(|p| p.color.clone()),
         is_archived: repo.is_archived,
         is_template: repo.is_template,
-        star_count: repo.stargazers.total_count,
+        star_count: repo.stargazer_count,
         fork_count: repo.fork_count,
+        extended_stats: BTreeMap::new(),
     })
 }
 
@@ -1670,12 +1534,6 @@ async fn fetch_gist(state: &AppState, id: &str) -> Result<GistCardData, AppError
     }
 
     let response = graphql_request::<GistData>(state, GIST_QUERY, json!({"gistName": id})).await?;
-
-    if let Some(errors) = &response.errors {
-        if let Some(first) = errors.first() {
-            return Err(AppError::Message(first.message.clone()));
-        }
-    }
 
     let gist = response
         .data
@@ -2005,7 +1863,7 @@ fn render_stats_card(
     stat_items.push(StatItem {
         id: "commits",
         icon: ICON_COMMITS,
-        label: Box::leak(commit_label.into_boxed_str()),
+        label: &commit_label,
         value: format_number(data.total_commits as f64, &number_format, number_precision),
     });
 
@@ -2091,6 +1949,20 @@ fn render_stats_card(
         value: format_number(data.contributed_to as f64, &number_format, number_precision),
     });
 
+    for &(id, label, icon) in EXTENDED_STAT_LABELS {
+        if show.contains(id) {
+            stat_items.push(StatItem {
+                id,
+                label,
+                icon,
+                value: format_number(
+                    *data.extended_stats.get(id).unwrap_or(&0) as f64,
+                    &number_format,
+                    number_precision,
+                ),
+            });
+        }
+    }
     stat_items.retain(|item| !hide.contains(item.id));
 
     if stat_items.is_empty() && hide_rank {
@@ -2176,9 +2048,7 @@ fn render_stats_card(
         let rank_y = height as f64 / 2.0 - 50.0;
 
         let rank_inner = match rank_icon_type {
-            "github" => format!(
-                r#"<svg x="-38" y="-30" height="66" width="66" viewBox="0 0 16 16" data-testid="github-rank-icon"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>"#
-            ),
+            "github" => r#"<svg x="-38" y="-30" height="66" width="66" viewBox="0 0 16 16" data-testid="github-rank-icon"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>"#.to_string(),
             "percentile" => format!(
                 r#"<text x="-5" y="-12" text-anchor="middle" class="rank-percentile-header">Top</text><text x="-5" y="12" text-anchor="middle" class="rank-percentile-text">{:.1}%</text>"#,
                 data.rank.percentile
@@ -2296,6 +2166,7 @@ fn render_top_languages_card(
 
     let hide_title = parse_bool_param(params, "hide_title").unwrap_or(false);
     let hide_border = parse_bool_param(params, "hide_border").unwrap_or(false);
+    let hide_values = parse_bool_param(params, "hide_values").unwrap_or(false);
     let hide_progress = parse_bool_param(params, "hide_progress").unwrap_or(false);
     let disable_animations = parse_bool_param(params, "disable_animations").unwrap_or(false);
     let layout = q(params, "layout").unwrap_or(if hide_progress { "compact" } else { "normal" });
@@ -2363,6 +2234,7 @@ fn render_top_languages_card(
                     width,
                     hide_progress,
                     stats_format,
+                    hide_values,
                     &colors,
                 ));
             }
@@ -2374,6 +2246,7 @@ fn render_top_languages_card(
                     total_size,
                     width,
                     stats_format,
+                    hide_values,
                 ));
             }
             "donut-vertical" => {
@@ -2383,11 +2256,18 @@ fn render_top_languages_card(
                     total_size,
                     width,
                     stats_format,
+                    hide_values,
                 ));
             }
             "pie" => {
                 height = 300 + ((langs.len() as f64 / 2.0).ceil() as i32) * 25;
-                body.push_str(&render_pie_layout(&langs, total_size, width, stats_format));
+                body.push_str(&render_pie_layout(
+                    &langs,
+                    total_size,
+                    width,
+                    stats_format,
+                    hide_values,
+                ));
             }
             _ => {
                 height = 45 + (langs.len() as i32 + 1) * 40;
@@ -2396,6 +2276,7 @@ fn render_top_languages_card(
                     total_size,
                     width,
                     stats_format,
+                    hide_values,
                     &colors,
                 ));
             }
@@ -2441,6 +2322,10 @@ fn render_repo_card(
     options: &RenderOptions,
 ) -> String {
     let colors = get_card_colors(options, "default_repocard");
+    let width = parse_i64_param(params, "card_width")
+        .unwrap_or(400)
+        .clamp(300, 2000) as i32;
+    let disable_animations = parse_bool_param(params, "disable_animations").unwrap_or(false);
     let hide_border = parse_bool_param(params, "hide_border").unwrap_or(false);
     let show_owner = parse_bool_param(params, "show_owner").unwrap_or(false);
     let border_radius = parse_f64_param(params, "border_radius").unwrap_or(4.5);
@@ -2453,7 +2338,7 @@ fn render_repo_card(
             .as_deref()
             .unwrap_or("No description provided"),
     );
-    let wrapped = wrap_text_multiline(&desc, 59, max_lines);
+    let wrapped = wrap_description(&desc, (width - 50) as f64, max_lines);
 
     let description_svg = wrapped
         .iter()
@@ -2474,12 +2359,17 @@ fn render_repo_card(
     };
 
     let description_lines_count = wrapped.len().max(1);
-    let height = (if description_lines_count > 1 {
+    let base_height = (if description_lines_count > 1 {
         120
     } else {
         110
     }) + description_lines_count as i32 * 10;
 
+    let extra_count = data.extended_stats.len() as i32;
+    let height = base_height + extra_count * 25;
+    let extra_rows = EXTENDED_STAT_LABELS.iter().filter_map(|&(id, label, icon)| {
+        data.extended_stats.get(id).map(|&value| format!(r#"<g data-testid="{id}" transform="translate(30,{})"><svg class="icon" width="16" height="16" viewBox="0 0 16 16">{icon}</svg><text class="gray" x="25" y="12">{label}: {}</text></g>"#, base_height - 50 + data.extended_stats.keys().position(|key| key == id).unwrap_or(0) as i32 * 25, k_formatter(value as f64, None)))
+    }).collect::<String>();
     let lang_name = data
         .primary_language_name
         .clone()
@@ -2527,7 +2417,8 @@ fn render_repo_card(
     }
     .map(|label| {
         format!(
-            r#"<g data-testid="badge" class="badge" transform="translate(320,-18)"><rect stroke="{}" stroke-width="1" width="70" height="20" x="-12" y="-14" ry="10" rx="10"></rect><text x="23" y="-5" alignment-baseline="central" dominant-baseline="central" text-anchor="middle" fill="{}">{}</text></g>"#,
+            r#"<g data-testid="badge" class="badge" transform="translate({},-18)"><rect stroke="{}" stroke-width="1" width="70" height="20" x="-12" y="-14" ry="10" rx="10"></rect><text x="23" y="-5" alignment-baseline="central" dominant-baseline="central" text-anchor="middle" fill="{}">{}</text></g>"#,
+            width - 80,
             colors.text_color,
             colors.text_color,
             escape_html(label)
@@ -2538,10 +2429,11 @@ fn render_repo_card(
     let body = format!(
         r#"
       {badge}
+      {extra_rows}
       <text class="description" x="25" y="-5">{description_svg}</text>
       <g transform="translate(30,{})">{stats_row}</g>
     "#,
-        height - 75
+        base_height - 75
     );
 
     let css = format!(
@@ -2556,14 +2448,14 @@ fn render_repo_card(
     );
 
     render_card(CardSpec {
-        width: 400,
+        width,
         height,
         hide_title: false,
         hide_border,
         title: header,
         title_prefix_icon: Some(ICON_CONTRIBS),
         border_radius,
-        disable_animations: true,
+        disable_animations,
         colors,
         css,
         body,
@@ -2578,6 +2470,7 @@ fn render_gist_card(
     options: &RenderOptions,
 ) -> String {
     let colors = get_card_colors(options, "default");
+    let disable_animations = parse_bool_param(params, "disable_animations").unwrap_or(false);
     let hide_border = parse_bool_param(params, "hide_border").unwrap_or(false);
     let show_owner = parse_bool_param(params, "show_owner").unwrap_or(false);
     let border_radius = parse_f64_param(params, "border_radius").unwrap_or(4.5);
@@ -2587,7 +2480,7 @@ fn render_gist_card(
             .as_deref()
             .unwrap_or("No description provided"),
     );
-    let wrapped = wrap_text_multiline(&desc, 59, 10);
+    let wrapped = wrap_description(&desc, 350.0, 10);
     let description_lines = wrapped.len().max(1);
     let description_svg = wrapped
         .iter()
@@ -2616,7 +2509,7 @@ fn render_gist_card(
         .clone()
         .unwrap_or_else(|| "Unspecified".to_string());
     let lang_color = LANGUAGE_COLORS
-        .get(&language)
+        .get(&language.to_ascii_lowercase())
         .cloned()
         .unwrap_or_else(|| "#858585".to_string());
 
@@ -2673,7 +2566,7 @@ fn render_gist_card(
         title: header,
         title_prefix_icon: Some(ICON_GIST),
         border_radius,
-        disable_animations: false,
+        disable_animations,
         colors,
         css,
         body,
@@ -2738,7 +2631,8 @@ fn render_wakatime_card(
     let height;
 
     if layout == "compact" {
-        height = 90 + ((languages.len() as f64 / 2.0).ceil() as i32) * 25;
+        height = (if hide_progress { 65 } else { 90 })
+            + ((languages.len() as f64 / 2.0).ceil() as i32) * 25;
 
         if !hide_progress {
             let compact_width = width as f64 - 5.0;
@@ -2749,7 +2643,7 @@ fn render_wakatime_card(
             ));
             for lang in &languages {
                 let color = LANGUAGE_COLORS
-                    .get(&lang.name)
+                    .get(&lang.name.to_ascii_lowercase())
                     .cloned()
                     .unwrap_or_else(|| "#858585".to_string());
                 let w = ((compact_width - 25.0) * lang.percent) / 100.0;
@@ -2768,7 +2662,7 @@ fn render_wakatime_card(
             for (idx, lang) in languages.iter().enumerate() {
                 let is_left = idx % 2 == 0;
                 let x = if is_left { left_x } else { right_x };
-                let y = 25 + ((idx / 2) as i32) * 25;
+                let y = (if hide_progress { 0 } else { 25 }) + ((idx / 2) as i32) * 25;
                 body.push_str(&create_compact_waka_lang(
                     lang,
                     x,
@@ -3029,9 +2923,9 @@ fn render_card(card: CardSpec) -> String {
         escape_html(&card.accessibility_desc),
         card.colors.title_color,
         card.colors.icon_color,
-        card.css,
+        format_args!("{}{}", card.colors.theme_css, card.css),
         animations_disable,
-        gradient,
+        format_args!("{}{}", gradient, card.colors.theme_defs),
         card.border_radius,
         card.colors.border_color,
         card.width - 1,
@@ -3055,10 +2949,11 @@ fn render_normal_lang_layout(
     total_size: f64,
     width: i32,
     stats_format: &str,
+    hide_values: bool,
     colors: &CardColors,
 ) -> String {
     let mut out = String::new();
-    let progress_width = (width - 95).max(80);
+    let progress_width = (width - if hide_values { 50 } else { 95 }).max(80);
     let progress_text_x = width - 85;
 
     for (idx, lang) in langs.iter().enumerate() {
@@ -3081,14 +2976,18 @@ fn render_normal_lang_layout(
             idx as i32 * 40,
             escape_html(&lang.name),
             progress_text_x,
-            escape_html(&value),
+            if hide_values {
+                String::new()
+            } else {
+                escape_html(&value)
+            },
             create_progress_node(
                 0,
                 25,
                 progress_width,
                 &lang.color,
                 pct,
-                "#ddd",
+                &colors.prog_bar_bg_color,
                 delay as i32 + 300,
             ),
         ));
@@ -3110,6 +3009,7 @@ fn render_compact_lang_layout(
     width: i32,
     hide_progress: bool,
     stats_format: &str,
+    hide_values: bool,
     _colors: &CardColors,
 ) -> String {
     let mut out = String::new();
@@ -3145,14 +3045,14 @@ fn render_compact_lang_layout(
     let left_svg = left
         .iter()
         .enumerate()
-        .map(|(idx, lang)| compact_lang_node(lang, total_size, hide_progress, stats_format, idx))
+        .map(|(idx, lang)| compact_lang_node(lang, total_size, hide_values, stats_format, idx))
         .collect::<Vec<_>>()
         .join("");
 
     let right_svg = right
         .iter()
         .enumerate()
-        .map(|(idx, lang)| compact_lang_node(lang, total_size, hide_progress, stats_format, idx))
+        .map(|(idx, lang)| compact_lang_node(lang, total_size, hide_values, stats_format, idx))
         .collect::<Vec<_>>()
         .join("");
 
@@ -3178,7 +3078,7 @@ fn longest_lang(langs: &[LangData]) -> Option<&LangData> {
 fn compact_lang_node(
     lang: &LangData,
     total_size: f64,
-    hide_progress: bool,
+    hide_values: bool,
     stats_format: &str,
     index: usize,
 ) -> String {
@@ -3196,7 +3096,7 @@ fn compact_lang_node(
         index as i32 * 25,
         lang.color,
         escape_html(&lang.name),
-        if hide_progress {
+        if hide_values {
             String::new()
         } else {
             escape_html(&value)
@@ -3209,6 +3109,7 @@ fn render_donut_lang_layout(
     total_size: f64,
     width: i32,
     stats_format: &str,
+    hide_values: bool,
 ) -> String {
     let center_x = width as f64 / 3.0;
     let center_y = width as f64 / 3.0;
@@ -3260,7 +3161,7 @@ fn render_donut_lang_layout(
                 r#"<g transform="translate(0,{y})"><circle cx="5" cy="6" r="5" fill="{}"/><text class="lang-name" x="15" y="10">{} {}</text></g>"#,
                 lang.color,
                 escape_html(&lang.name),
-                escape_html(&value),
+                if hide_values { String::new() } else { escape_html(&value) },
             )
         })
         .collect::<Vec<_>>()
@@ -3277,6 +3178,7 @@ fn render_donut_vertical_layout(
     total_size: f64,
     _width: i32,
     stats_format: &str,
+    hide_values: bool,
 ) -> String {
     let radius = 80.0;
     let circumference = 2.0 * PI * radius;
@@ -3296,7 +3198,7 @@ fn render_donut_vertical_layout(
         offset += len;
     }
 
-    let legends = compact_legend_nodes(langs, total_size, stats_format);
+    let legends = compact_legend_nodes(langs, total_size, stats_format, hide_values);
 
     format!(
         r#"<svg data-testid="lang-items"><g transform="translate(0,0)"><svg data-testid="donut">{circles}</svg></g><g transform="translate(0,220)"><svg data-testid="lang-names" x="25">{legends}</svg></g></svg>"#
@@ -3308,6 +3210,7 @@ fn render_pie_layout(
     total_size: f64,
     _width: i32,
     stats_format: &str,
+    hide_values: bool,
 ) -> String {
     let radius = 90.0;
     let cx = 150.0;
@@ -3346,14 +3249,19 @@ fn render_pie_layout(
         }
     }
 
-    let legends = compact_legend_nodes(langs, total_size, stats_format);
+    let legends = compact_legend_nodes(langs, total_size, stats_format, hide_values);
 
     format!(
         r#"<svg data-testid="lang-items"><g transform="translate(0,0)"><svg data-testid="pie">{paths}</svg></g><g transform="translate(0,220)"><svg data-testid="lang-names" x="25">{legends}</svg></g></svg>"#
     )
 }
 
-fn compact_legend_nodes(langs: &[LangData], total_size: f64, stats_format: &str) -> String {
+fn compact_legend_nodes(
+    langs: &[LangData],
+    total_size: f64,
+    stats_format: &str,
+    hide_values: bool,
+) -> String {
     let half = ((langs.len() as f64 / 2.0).ceil() as usize).max(1);
     let (left, right) = langs.split_at(half.min(langs.len()));
 
@@ -3373,7 +3281,7 @@ fn compact_legend_nodes(langs: &[LangData], total_size: f64, stats_format: &str)
                     r#"<g transform="translate(0,{y})"><circle cx="5" cy="6" r="5" fill="{}" /><text x="15" y="10" class="lang-name">{} {}</text></g>"#,
                     lang.color,
                     escape_html(&lang.name),
-                    escape_html(&value),
+                    if hide_values { String::new() } else { escape_html(&value) },
                 )
             })
             .collect::<Vec<_>>()
@@ -3401,7 +3309,7 @@ fn create_compact_waka_lang(
     _colors: &CardColors,
 ) -> String {
     let color = LANGUAGE_COLORS
-        .get(&lang.name)
+        .get(&lang.name.to_ascii_lowercase())
         .cloned()
         .unwrap_or_else(|| "#858585".to_string());
     let value = if display_format == "percent" {
@@ -3510,7 +3418,7 @@ fn measure_text(text: &str, font_size: f64) -> f64 {
             TEXT_WIDTHS
                 .get(ch as usize)
                 .copied()
-                .unwrap_or(TEXT_WIDTH_AVG)
+                .unwrap_or(if matches!(ch as u32, 0x2e80..=0xa4cf | 0xac00..=0xd7af | 0xf900..=0xfaff | 0xff01..=0xff60 | 0x1f000..=0x1faff) { 1.0 } else { TEXT_WIDTH_AVG })
         })
         .sum::<f64>()
         * font_size
@@ -3556,35 +3464,6 @@ fn format_bytes(bytes: f64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
     let i = (bytes.log(1024.0).floor() as usize).min(units.len() - 1);
     format!("{:.1} {}", bytes / 1024f64.powi(i as i32), units[i])
-}
-
-fn wrap_text_multiline(text: &str, width: usize, max_lines: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-
-    for word in text.split_whitespace() {
-        if current.len() + word.len() + 1 > width {
-            if !current.is_empty() {
-                lines.push(current.trim().to_string());
-                current.clear();
-                if lines.len() >= max_lines {
-                    break;
-                }
-            }
-        }
-        current.push_str(word);
-        current.push(' ');
-    }
-
-    if lines.len() < max_lines && !current.trim().is_empty() {
-        lines.push(current.trim().to_string());
-    }
-
-    if lines.len() > max_lines {
-        lines.truncate(max_lines);
-    }
-
-    lines
 }
 
 fn wrap_line(text: &str, width: usize) -> String {
